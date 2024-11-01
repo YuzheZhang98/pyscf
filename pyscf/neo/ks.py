@@ -152,6 +152,10 @@ class KS(HF):
             self.mf_elec = dft.UKS(mol.elec)
         else:
             self.mf_elec = dft.RKS(mol.elec)
+        # if 'on_gpu' in kwargs and kwargs['on_gpu'] is True:
+        #     self.mf_elec = self.mf_elec.to_gpu()
+        if self.on_gpu:
+            self.mf_elec = self.mf_elec.to_gpu()
         if 'df_ee' in kwargs:
             df_ee = kwargs['df_ee']
         else:

@@ -16,7 +16,21 @@ from pyscf.lib import logger
 from pyscf.scf import _vhf, chkfile
 from pyscf.scf.hf import TIGHT_GRAD_CONV_TOL
 from pyscf.qmmm.itrf import qmmm_for_scf
+try:
+    from gpu4pyscf.lib.cupy_helper import to_cupy, CPArrayWithTag
+    import cupy
 
+except ImportError:
+    pass
+
+def to_numpy(a):
+    if isinstance(a, CPArrayWithTag):
+        attrs = {k: to_numpy(v) for k, v in a.__dict__.items()}
+        from pyscf.lib.numpy_helper import tag_array
+        return tag_array(cupy.asnumpy(a), **attrs)
+    if isinstance(a, cupy.ndarray):
+        return cupy.asnumpy(a)
+    return a
 
 def dot_eri_dm(eri, dms, nao_v=None, eri_dot_dm=True):
     assert(eri.dtype == numpy.double)
@@ -351,7 +365,7 @@ def get_init_guess_nuc(mf, mol):
     return mf.make_rdm1(mo_coeff, mo_occ)
 
 def get_hcore_elec(mol, mf_elec, mol_nuc=None, dm_nuc=None,
-                   mol_positron=None, dm_positron=None, eri_ne=None):
+                   mol_positron=None, dm_positron=None, eri_ne=None, on_gpu=False):
     '''Get the core Hamiltonian for electrons in NEO'''
     super_mol = mol.super_mol
     if mol_nuc is None: mol_nuc = super_mol.nuc
@@ -374,6 +388,8 @@ def get_hcore_elec(mol, mf_elec, mol_nuc=None, dm_nuc=None,
         if vj.ndim > 2:
             vj = vj[0] + vj[1]
         j -= vj
+    if on_gpu:
+        return to_numpy(mf_elec.hcore_static) + j
     return mf_elec.hcore_static + j
 
 def get_hcore_positron(mol, mf_positron, mol_elec=None, dm_elec=None,
@@ -459,6 +475,8 @@ def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1, diis=None,
                 s1e += [s1e_p, s1e_p]
             else:
                 s1e += [s1e_p]
+    if mf.on_gpu:
+        s1e = [to_numpy(arr) for arr in s1e]
     if h1e is None:
         h1e = [mf.mf_elec.get_hcore()]
         h1e += [mf.mf_nuc[i].get_hcore() for i in range(mol.nuc_num)]
@@ -472,10 +490,16 @@ def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1, diis=None,
             vhf += [mf.mf_positron.get_veff(mol.positron, mf.dm_positron)]
 
     if mf.dm_elec.ndim > 2: # UHF/UKS
-        f = [h1e[0] + vhf[0][0], h1e[0] + vhf[0][1]]
+        if mf.on_gpu:
+            f = [h1e[0] + to_numpy(vhf[0][0]), h1e[0] + to_numpy(vhf[0][1])]
+        else:
+            f = [h1e[0] + vhf[0][0], h1e[0] + vhf[0][1]]
         start = 2
     else:
-        f = [h1e[0] + vhf[0]]
+        if mf.on_gpu:
+            f = [h1e[0] + to_numpy(vhf[0])]
+        else:
+            f = [h1e[0] + vhf[0]]
         start = 1
     for i in range(mol.nuc_num):
         f.append(h1e[i + 1] + vhf[i + 1])
@@ -810,7 +834,10 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
             dm += [mf.dm_positron]
 
     h1e = [mf.mf_elec.get_hcore()]
-    vhf = [mf.mf_elec.get_veff(mol.elec, mf.dm_elec)]
+    if mf.on_gpu:
+        vhf = [mf.mf_elec.get_veff(mol.elec, to_cupy(mf.dm_elec))]
+    else:
+        vhf = [mf.mf_elec.get_veff(mol.elec, mf.dm_elec)]
     for i in range(mol.nuc_num):
         h1e.append(mf.mf_nuc[i].get_hcore())
         vhf.append(mf.mf_nuc[i].get_veff(mol.nuc[i], mf.dm_nuc[i]))
@@ -837,7 +864,10 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         s1e = [s1e_e, s1e_e]
     else:
         s1e = [s1e_e]
-    cond = lib.cond(s1e[0])
+    if mf.on_gpu:
+        cond = lib.cond(to_numpy(s1e[0]))
+    else:
+        cond = lib.cond(s1e[0])
     logger.debug(mf, 'cond(S) = %s', cond)
     if numpy.max(cond) * 1e-17 > conv_tol:
         logger.warn(mf, 'Singularity detected in overlap matrix (condition number = %4.3g). '
@@ -860,7 +890,10 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         else:
             fock_e = fock[0]
             start = 1
-        mo_energy_e, mo_coeff_e = mf.mf_elec.eig(fock_e, s1e[0])
+        if mf.on_gpu:
+            mo_energy_e, mo_coeff_e = mf.mf_elec.eig(to_cupy(fock_e), s1e[0])
+        else:
+            mo_energy_e, mo_coeff_e = mf.mf_elec.eig(fock_e, s1e[0])
         mf.mf_elec.mo_energy, mf.mf_elec.mo_coeff = mo_energy_e, mo_coeff_e
         mo_occ_e = mf.mf_elec.get_occ(mo_energy_e, mo_coeff_e)
         mf.mf_elec.mo_occ = mo_occ_e
@@ -922,13 +955,19 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         else:
             fock_e = fock[0]
             start = 1
-        mo_energy_e, mo_coeff_e = mf.mf_elec.eig(fock_e, s1e[0])
+        if mf.on_gpu:
+            mo_energy_e, mo_coeff_e = mf.mf_elec.eig(to_cupy(fock_e), s1e[0])
+        else:
+            mo_energy_e, mo_coeff_e = mf.mf_elec.eig(fock_e, s1e[0])
         mf.mf_elec.mo_energy, mf.mf_elec.mo_coeff = mo_energy_e, mo_coeff_e
         mo_occ_e = mf.mf_elec.get_occ(mo_energy_e, mo_coeff_e)
         mf.mf_elec.mo_occ = mo_occ_e
         mf.dm_elec = mf.mf_elec.make_rdm1(mo_coeff_e, mo_occ_e)
         # attach mo_coeff and mo_occ to dm to improve DFT get_veff efficiency
-        mf.dm_elec = lib.tag_array(mf.dm_elec, mo_coeff=mo_coeff_e, mo_occ=mo_occ_e)
+        if mf.on_gpu:
+            mf.dm_elec = lib.tag_array(to_numpy(mf.dm_elec), mo_coeff=mo_coeff_e, mo_occ=mo_occ_e)
+        else:
+            mf.dm_elec = lib.tag_array(mf.dm_elec, mo_coeff=mo_coeff_e, mo_occ=mo_occ_e)
 
         for i in range(mol.nuc_num):
             fock_n = fock[start + i]
@@ -964,7 +1003,10 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         # update the so-called "core" Hamiltonian and veff after the density is updated
         h1e = [mf.mf_elec.get_hcore()]
         vhf_last = vhf
-        vhf = [mf.mf_elec.get_veff(mol.elec, mf.dm_elec, dm_elec_last, vhf_last[0])]
+        if mf.on_gpu:
+            vhf = [mf.mf_elec.get_veff(mol.elec, to_cupy(mf.dm_elec), dm_elec_last, to_cupy(vhf_last[0]))]
+        else:
+            vhf = [mf.mf_elec.get_veff(mol.elec, mf.dm_elec, dm_elec_last, vhf_last[0])]
         for i in range(mol.nuc_num):
             h1e.append(mf.mf_nuc[i].get_hcore())
             vhf.append(mf.mf_nuc[i].get_veff(mol.nuc[i], mf.dm_nuc[i],
@@ -983,7 +1025,10 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
             fock_e = numpy.asarray((fock[0], fock[1]))
         else:
             fock_e = fock[0]
-        norm_gorb_e = numpy.linalg.norm(mf.mf_elec.get_grad(mo_coeff_e, mo_occ_e, fock_e))
+        if mf.on_gpu:
+            norm_gorb_e = numpy.linalg.norm(mf.mf_elec.get_grad(mo_coeff_e, mo_occ_e, to_cupy(fock_e)))
+        else:
+            norm_gorb_e = numpy.linalg.norm(mf.mf_elec.get_grad(mo_coeff_e, mo_occ_e, fock_e))
         if not TIGHT_GRAD_CONV_TOL:
             norm_gorb_e = norm_gorb_e / numpy.sqrt(norm_gorb_e.size)
         norm_ddm_e = numpy.linalg.norm(mf.dm_elec - dm_elec_last)
@@ -1051,12 +1096,18 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
     if scf_conv and conv_check:
         # An extra diagonalization, to remove level shift
         #fock = mf.get_fock(h1e, s1e, vhf, dm)  # = h1e + vhf
-        mo_energy_e, mo_coeff_e = mf.mf_elec.eig(fock_e, s1e[0])
+        if mf.on_gpu:
+            mo_energy_e, mo_coeff_e = mf.mf_elec.eig(to_cupy(fock_e), s1e[0])
+        else:
+            mo_energy_e, mo_coeff_e = mf.mf_elec.eig(fock_e, s1e[0])
         mf.mf_elec.mo_energy, mf.mf_elec.mo_coeff = mo_energy_e, mo_coeff_e
         mo_occ_e = mf.mf_elec.get_occ(mo_energy_e, mo_coeff_e)
         mf.mf_elec.mo_occ = mo_occ_e
         mf.dm_elec, dm_elec_last = mf.mf_elec.make_rdm1(mo_coeff_e, mo_occ_e), mf.dm_elec
-        mf.dm_elec = lib.tag_array(mf.dm_elec, mo_coeff=mo_coeff_e, mo_occ=mo_occ_e)
+        if mf.on_gpu:
+            mf.dm_elec = lib.tag_array(to_numpy(mf.dm_elec), mo_coeff=mo_coeff_e, mo_occ=mo_occ_e)
+        else:
+            mf.dm_elec = lib.tag_array(mf.dm_elec, mo_coeff=mo_coeff_e, mo_occ=mo_occ_e)
 
         for i in range(mol.nuc_num):
             fock_n = fock[start + i]
@@ -1088,7 +1139,10 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         # update the so-called "core" Hamiltonian and veff after the density is updated
         h1e = [mf.mf_elec.get_hcore()]
         vhf_last = vhf
-        vhf = [mf.mf_elec.get_veff(mol.elec, mf.dm_elec, dm_elec_last, vhf_last[0])]
+        if mf.on_gpu:
+            vhf = [mf.mf_elec.get_veff(mol.elec, to_cupy(mf.dm_elec), dm_elec_last, to_cupy(vhf_last[0]))]
+        else:
+            vhf = [mf.mf_elec.get_veff(mol.elec, mf.dm_elec, dm_elec_last, vhf_last[0])]
         for i in range(mol.nuc_num):
             h1e.append(mf.mf_nuc[i].get_hcore())
             vhf.append(mf.mf_nuc[i].get_veff(mol.nuc[i], mf.dm_nuc[i],
@@ -1112,7 +1166,10 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
             fock_e = numpy.asarray((fock[0], fock[1]))
         else:
             fock_e = fock[0]
-        norm_gorb_e = numpy.linalg.norm(mf.mf_elec.get_grad(mo_coeff_e, mo_occ_e, fock_e))
+        if mf.on_gpu:
+            norm_gorb_e = numpy.linalg.norm(mf.mf_elec.get_grad(mo_coeff_e, mo_occ_e, to_cupy(fock_e)))
+        else:
+            norm_gorb_e = numpy.linalg.norm(mf.mf_elec.get_grad(mo_coeff_e, mo_occ_e, fock_e))
         if not TIGHT_GRAD_CONV_TOL:
             norm_gorb_e = norm_gorb_e / numpy.sqrt(norm_gorb_e.size)
         norm_ddm_e = numpy.linalg.norm(mf.dm_elec - dm_elec_last)
@@ -1270,8 +1327,9 @@ class HF(scf.hf.SCF):
     '''
 
     def __init__(self, mol, unrestricted=False, df_ee=False,
-                 auxbasis_e=None, only_dfj_e=False):
+                 auxbasis_e=None, only_dfj_e=False, on_gpu=False):
         scf.hf.SCF.__init__(self, mol)
+        self.on_gpu = on_gpu
         if mol.elec.nhomo is not None or mol.spin != 0:
             unrestricted = True
         # NOTE: LIMIT: when EITHER electron or positron wave function
@@ -1315,6 +1373,8 @@ class HF(scf.hf.SCF):
             self.mf_elec = scf.UHF(mol.elec)
         else:
             self.mf_elec = scf.RHF(mol.elec)
+        if on_gpu:
+            self.mf_elec = self.mf_elec.to_gpu()
         if mol.positron is not None:
             if unrestricted:
                 self.mf_positron = scf.UHF(mol.positron)
@@ -1392,7 +1452,7 @@ class HF(scf.hf.SCF):
     def get_hcore_elec(self, mol=None):
         if mol is None: mol = self.mol.elec
         return get_hcore_elec(mol, self.mf_elec, self.mol.nuc, self.dm_nuc,
-                              self.mol.positron, self.dm_positron, eri_ne=self._eri_ne)
+                              self.mol.positron, self.dm_positron, eri_ne=self._eri_ne, on_gpu=self.on_gpu)
 
     def get_hcore_positron(self, mol=None):
         if mol is None: mol = self.mol.positron
