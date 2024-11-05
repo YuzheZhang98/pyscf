@@ -10,6 +10,10 @@ from pyscf.dft.numint import eval_ao, eval_rho, _scale_ao, _dot_ao_ao, _dot_ao_a
 from pyscf.neo.hf import HF
 from pyscf.dft.gen_grid import NBINS
 from pyscf.qmmm.itrf import qmmm_for_scf
+try:
+    import gpu4pyscf.qmmm
+except ImportError:
+    pass
 
 def eval_xc_nuc(epc, rho_e, rho_n):
     '''evaluate e_xc and v_xc of proton on a grid (epc17)'''
@@ -172,7 +176,10 @@ class KS(HF):
             self.mf_elec = self.mf_elec.density_fit(auxbasis=auxbasis_e,
                                                     only_dfj=only_dfj_e)
         if self.mol.mm_mol is not None:
-            self.mf_elec = qmmm_for_scf(self.mf_elec, self.mol.mm_mol)
+            if self.on_gpu:
+                self.mf_elec = gpu4pyscf.qmmm.itrf.qmmm_for_scf(self.mf_elec, self.mol.mm_mol)
+            else:
+                self.mf_elec = qmmm_for_scf(self.mf_elec, self.mol.mm_mol)
         # need to repeat these lines because self.mf_elec got overwritten
         self.mf_elec.xc = 'b3lyp' # use b3lyp as the default xc functional for electrons
         self.mf_elec.get_hcore = self.get_hcore_elec

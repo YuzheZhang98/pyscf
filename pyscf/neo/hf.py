@@ -17,9 +17,9 @@ from pyscf.scf import _vhf, chkfile
 from pyscf.scf.hf import TIGHT_GRAD_CONV_TOL
 from pyscf.qmmm.itrf import qmmm_for_scf
 try:
-    from gpu4pyscf.lib.cupy_helper import to_cupy, CPArrayWithTag
     import cupy
-
+    import gpu4pyscf.qmmm
+    from gpu4pyscf.lib.cupy_helper import to_cupy, CPArrayWithTag
 except ImportError:
     pass
 
@@ -1384,7 +1384,10 @@ class HF(scf.hf.SCF):
             self.mf_elec = self.mf_elec.density_fit(auxbasis=auxbasis_e,
                                                     only_dfj=only_dfj_e)
         if self.mol.mm_mol is not None:
-            self.mf_elec = qmmm_for_scf(self.mf_elec, self.mol.mm_mol)
+            if on_gpu:
+                self.mf_elec = gpu4pyscf.qmmm.itrf.qmmm_for_scf(self.mf_elec, self.mol.mm_mol)
+            else:
+                self.mf_elec = qmmm_for_scf(self.mf_elec, self.mol.mm_mol)
         self.mf_elec.get_hcore = self.get_hcore_elec
         self.mf_elec.hcore_static = None # cache true hcore
         if mol.elec.nhomo is not None:

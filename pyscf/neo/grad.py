@@ -14,6 +14,10 @@ from pyscf.dft.numint import eval_ao, eval_rho, _scale_ao
 from pyscf.neo.ks import eval_xc_nuc, eval_xc_elec
 from pyscf.grad.rks import _d1_dot_
 from pyscf.qmmm.itrf import qmmm_grad_for_scf
+try:
+    import gpu4pyscf.qmmm
+except ImportError:
+    pass
 import warnings
 
 
@@ -323,14 +327,17 @@ class Gradients(rhf_grad.GradientsMixin):
     >>> g.kernel()
     '''
 
-    def __init__(self, scf_method):
+    def __init__(self, scf_method, on_gpu=False):
         rhf_grad.GradientsMixin.__init__(self, scf_method)
         self.grid_response = None
         self.g_elec = self.base.mf_elec.nuc_grad_method() # elec part obj
         self.g_elec.verbose = self.verbose - 1
         if self.mol.mm_mol is not None:
             # decorate elec part gradient
-            self.g_elec = qmmm_grad_for_scf(self.g_elec)
+            if on_gpu:
+                self.g_elec = gpu4pyscf.qmmm.itrf.qmmm_grad_for_scf(self.g_elec)
+            else:
+                self.g_elec = qmmm_grad_for_scf(self.g_elec)
             self.g_elec.base.mm_mol = self.mol.mm_mol
         self._keys = self._keys.union(['grid_response', 'g_elec'])
 
