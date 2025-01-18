@@ -144,8 +144,14 @@ def get_j_e_dm_n(idx_nuc, dm_n, mol_elec=None, mol_nuc=None, eri_ne=None):
         if eri_ne[idx_nuc] is None:
             eri_ne[idx_nuc] = _build_eri_ne(mol_elec, mol_nuc)
         if eri_ne[idx_nuc] is not None:
-            return -charge * dot_eri_dm(eri_ne[idx_nuc], dm_n, nao_v=mol_elec.nao,
-                                        eri_dot_dm=False)
+            if mol_elec.super_mol.verbose >= logger.DEBUG:
+                cput0 = (logger.process_clock(), logger.perf_counter())
+            ded = dot_eri_dm(eri_ne[idx_nuc], dm_n, nao_v=mol_elec.nao,
+                             eri_dot_dm=False)
+            if mol_elec.super_mol.verbose >= logger.DEBUG:
+                logger.timer(mol_elec.super_mol,
+                            f'dot_eri_dm of {idx_nuc}-th nucleus on electron in get_j_e_dm_n ', *cput0)
+            return -charge * ded
     if not mol_elec.super_mol.direct_vee:
         warnings.warn('Direct Vee is used for e-n ERIs, might be slow. '
                       +f'PYSCF_MAX_MEMORY is set to {mol_elec.super_mol.max_memory} MB, '
@@ -162,8 +168,14 @@ def get_j_n_dm_e(idx_nuc, dm_e, mol_elec=None, mol_nuc=None, eri_ne=None):
         if eri_ne[idx_nuc] is None:
             eri_ne[idx_nuc] = _build_eri_ne(mol_elec, mol_nuc)
         if eri_ne[idx_nuc] is not None:
-            return -charge * dot_eri_dm(eri_ne[idx_nuc], dm_e, nao_v=mol_nuc.nao,
-                                        eri_dot_dm=True)
+            if mol_elec.super_mol.verbose >= logger.DEBUG:
+                cput0 = (logger.process_clock(), logger.perf_counter())
+            ded = dot_eri_dm(eri_ne[idx_nuc], dm_e, nao_v=mol_nuc.nao,
+                             eri_dot_dm=True)
+            if mol_elec.super_mol.verbose >= logger.DEBUG:
+                logger.timer(mol_elec.super_mol,
+                            f'dot_eri_dm of electron on {idx_nuc}-th nucleus in get_j_n_dm_e', *cput0)
+            return -charge * ded
     if not mol_elec.super_mol.direct_vee:
         warnings.warn('Direct Vee is used for e-n ERIs, might be slow. '
                       +f'PYSCF_MAX_MEMORY is set to {mol_elec.super_mol.max_memory} MB, '
@@ -182,16 +194,28 @@ def get_j_nn(idx1, idx2, dm_n2, mol_nuc1=None, mol_nuc2=None, eri_nn=None):
             if eri_nn[idx1][idx2] is None:
                 eri_nn[idx1][idx2] = _build_eri_nn(mol_nuc1, mol_nuc2)
             if eri_nn[idx1][idx2] is not None:
-                return charge * dot_eri_dm(eri_nn[idx1][idx2], dm_n2,
-                                           nao_v=mol_nuc1.nao,
-                                           eri_dot_dm=True)
+                if mol_nuc1.super_mol.verbose >= logger.DEBUG:
+                    cput0 = (logger.process_clock(), logger.perf_counter())
+                ded = dot_eri_dm(eri_nn[idx1][idx2], dm_n2,
+                                 nao_v=mol_nuc1.nao,
+                                 eri_dot_dm=True)
+                if mol_nuc1.super_mol.verbose >= logger.DEBUG:
+                    logger.timer(mol_nuc1.super_mol,
+                                f'dot_eri_dm of {idx2}-th nucleus on {idx1}-th nucleus in get_j_nn', *cput0)
+                return charge * ded
         elif idx1 > idx2:
             if eri_nn[idx2][idx1] is None:
                 eri_nn[idx2][idx1] = _build_eri_nn(mol_nuc2, mol_nuc1)
             if eri_nn[idx2][idx1] is not None:
-                return charge * dot_eri_dm(eri_nn[idx2][idx1], dm_n2,
-                                           nao_v=mol_nuc1.nao,
-                                           eri_dot_dm=False)
+                if mol_nuc1.super_mol.verbose >= logger.DEBUG:
+                    cput0 = (logger.process_clock(), logger.perf_counter())
+                ded = dot_eri_dm(eri_nn[idx2][idx1], dm_n2,
+                                 nao_v=mol_nuc1.nao,
+                                 eri_dot_dm=False)
+                if mol_nuc1.super_mol.verbose >= logger.DEBUG:
+                    logger.timer(mol_nuc1.super_mol,
+                                f'dot_eri_dm of {idx2}-th nucleus on {idx1}-th nucleus in get_j_nn', *cput0)
+                return charge * ded
         elif idx1 == idx2:
             return 0.0
     if not mol_nuc1.super_mol.direct_vee:
