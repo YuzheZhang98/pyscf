@@ -1,20 +1,19 @@
 #!/usr/bin/env python
 
 '''
-Analytic gradient for density-fitting interaction Coulomb in CDFT
+Analytic gradient for density-fitting Coulomb interaction in CNEO-DFT
 '''
 
 import numpy
 import scipy
 from pyscf import lib
-from pyscf.scf.jk import get_jk
 from pyscf.grad import rhf as rhf_grad
 from pyscf.neo import grad
 from pyscf.lib import logger
 from pyscf.df.grad.rhf import _int3c_wrapper, balance_partition
 
 
-def get_cross_j(mol_e, mol_n, auxmol_e, dm_e, dm_n, atmlst, max_memory,
+def get_cross_j(mol_e, mol_n, auxmol_e, dm_e, dm_n, charge_n, atmlst, max_memory,
                 auxbasis_response=True):
     """Calculate the cross J terms for molecular gradient calculations
     in CNEO density-fitting.
@@ -28,6 +27,7 @@ def get_cross_j(mol_e, mol_n, auxmol_e, dm_e, dm_n, atmlst, max_memory,
     numpy.ndarray
         The gradient contribution with shape (len(atmlst), 3).
     """
+    assert isinstance(mol_n, dict) and isinstance(dm_n, dict)
 
     def get_packed_dm(nao, dm):
         assert dm.ndim == 2 # Does not support multiple dm's yet
@@ -48,7 +48,18 @@ def get_cross_j(mol_e, mol_n, auxmol_e, dm_e, dm_n, atmlst, max_memory,
             int3c = None
         return rhoj
 
-    def process_vj_block(get_int3c, mol, rhoj, ao_ranges, aux_loc):
+    def process_vj_block_e(get_int3c, mol, rhoj_n, ao_ranges, aux_loc):
+        nao = mol.nao
+        vj = numpy.zeros((3, nao, nao))
+        for shl0, shl1, _ in ao_ranges:
+            int3c = get_int3c((0, mol.nbas, 0, mol.nbas, shl0, shl1))
+            p0, p1 = aux_loc[shl0], aux_loc[shl1]
+            for t, rhoj in rhoj_n.items():
+                vj += lib.einsum('xijp,p->xij', int3c, rhoj[p0:p1]) * charge_n[t]
+            int3c = None
+        return vj
+
+    def process_vj_block_n(get_int3c, mol, rhoj, ao_ranges, aux_loc):
         nao = mol.nao
         vj = numpy.zeros((3, nao, nao))
         for shl0, shl1, _ in ao_ranges:
@@ -59,20 +70,19 @@ def get_cross_j(mol_e, mol_n, auxmol_e, dm_e, dm_n, atmlst, max_memory,
         return vj
 
     get_int3c_s2_e = _int3c_wrapper(mol_e, auxmol_e, 'int3c2e', 's2ij')
-    get_int3c_s2_n = _int3c_wrapper(mol_n, auxmol_e, 'int3c2e', 's2ij')
     get_int3c_ip1_e = _int3c_wrapper(mol_e, auxmol_e, 'int3c2e_ip1', 's1')
-    get_int3c_ip1_n = _int3c_wrapper(mol_n, auxmol_e, 'int3c2e_ip1', 's1')
     get_int3c_ip2_e = _int3c_wrapper(mol_e, auxmol_e, 'int3c2e_ip2', 's2ij')
-    get_int3c_ip2_n = _int3c_wrapper(mol_n, auxmol_e, 'int3c2e_ip2', 's2ij')
 
     nao_e = mol_e.nao
-    nao_n = mol_n.nao
     naux = auxmol_e.nao
     dm_e = numpy.asarray(dm_e)
-    dm_n = numpy.asarray(dm_n)
 
     dm_tril_e = get_packed_dm(nao_e, dm_e)
-    dm_tril_n = get_packed_dm(nao_n, dm_n)
+    dm_tril_n = {}
+    for t, dm in dm_n.items():
+        mol = mol_n[t]
+        dm = numpy.asarray(dm)
+        dm_tril_n[t] = get_packed_dm(mol.nao, dm)
 
     aux_loc = auxmol_e.ao_loc
     max_memory_ = max_memory - lib.current_memory()[0]
@@ -82,22 +92,26 @@ def get_cross_j(mol_e, mol_n, auxmol_e, dm_e, dm_n, atmlst, max_memory,
     # (i,j|P) for e
     rhoj_e = process_rhoj_block(get_int3c_s2_e, mol_e, dm_tril_e, ao_ranges_e, aux_loc)
 
-    max_memory_ = max_memory - lib.current_memory()[0]
-    blksize = int(min(max(max_memory_ * .5e6/8 / (nao_n**2*3), 20), naux, 240))
-    ao_ranges_n = balance_partition(aux_loc, blksize)
-
     # (I,J|P) for n
-    rhoj_n = process_rhoj_block(get_int3c_s2_n, mol_n, dm_tril_n, ao_ranges_n, aux_loc)
+    rhoj_n = {}
+    ao_ranges_n = {}
+    for t, mol in mol_n.items():
+        max_memory_ = max_memory - lib.current_memory()[0]
+        blksize = int(min(max(max_memory_ * .5e6/8 / (mol.nao**2*3), 20), naux, 240))
+        ao_ranges_n[t] = balance_partition(aux_loc, blksize)
+        get_int3c_s2_n = _int3c_wrapper(mol, auxmol_e, 'int3c2e', 's2ij')
+        rhoj_n[t] = process_rhoj_block(get_int3c_s2_n, mol, dm_tril_n[t], ao_ranges_n[t], aux_loc)
 
     # (P|Q)
     int2c = auxmol_e.intor('int2c2e', aosym='s1')
     rhoj_e = scipy.linalg.solve(int2c, rhoj_e.T, assume_a='pos').T
-    rhoj_n = scipy.linalg.solve(int2c, rhoj_n.T, assume_a='pos').T
+    for t, rhoj in rhoj_n.items():
+        rhoj_n[t] = scipy.linalg.solve(int2c, rhoj.T, assume_a='pos').T
     int2c = None
 
     de = numpy.zeros((len(atmlst), 3))
     # (d/dX i,j|P)
-    vj = process_vj_block(get_int3c_ip1_e, mol_e, rhoj_n, ao_ranges_e, aux_loc)
+    vj = process_vj_block_e(get_int3c_ip1_e, mol_e, rhoj_n, ao_ranges_e, aux_loc)
     aoslices = mol_e.aoslice_by_atom()
 
     for k, ia in enumerate(atmlst):
@@ -105,36 +119,42 @@ def get_cross_j(mol_e, mol_n, auxmol_e, dm_e, dm_n, atmlst, max_memory,
         de[k] -= 2 * lib.einsum('xij,ij->x', vj[:, p0:p1], dm_e[p0:p1])
 
     # (d/dX I,J|P)
-    vj = process_vj_block(get_int3c_ip1_n, mol_n, rhoj_e, ao_ranges_n, aux_loc)
-    aoslices = mol_n.aoslice_by_atom()
+    for t, mol in mol_n.items():
+        get_int3c_ip1_n = _int3c_wrapper(mol, auxmol_e, 'int3c2e_ip1', 's1')
+        vj = process_vj_block_n(get_int3c_ip1_n, mol, rhoj_e, ao_ranges_n[t], aux_loc) * charge_n[t]
+        aoslices = mol.aoslice_by_atom()
 
-    for k, ia in enumerate(atmlst):
-        p0, p1 = aoslices[ia, 2:]
-        de[k] -= 2 * lib.einsum('xij,ij->x', vj[:, p0:p1], dm_n[p0:p1])
+        for k, ia in enumerate(atmlst):
+            p0, p1 = aoslices[ia, 2:]
+            de[k] -= 2 * lib.einsum('xij,ij->x', vj[:, p0:p1], dm_n[t][p0:p1])
 
     vj = None
 
     if auxbasis_response:
         # (i,j|d/dX P) and (I,J|d/dX P)
-        vjaux = numpy.empty((3, naux))
+        vjaux = numpy.zeros((3, naux))
         for shl0, shl1, _ in ao_ranges_e:
             int3c = get_int3c_ip2_e((0, mol_e.nbas, 0, mol_e.nbas, shl0, shl1))  # (i,j|P)
             p0, p1 = aux_loc[shl0], aux_loc[shl1]
-            vjaux[:, p0:p1] = lib.einsum('xwp,w,p->xp',
-                                         int3c, dm_tril_e, rhoj_n[p0:p1])
+            for t, rhoj in rhoj_n.items():
+                vjaux[:, p0:p1] += lib.einsum('xwp,w,p->xp',
+                                              int3c, dm_tril_e, rhoj[p0:p1]) * charge_n[t]
             int3c = None
 
-        for shl0, shl1, _ in ao_ranges_n:
-            int3c = get_int3c_ip2_n((0, mol_n.nbas, 0, mol_n.nbas, shl0, shl1))  # (I,J|P)
-            p0, p1 = aux_loc[shl0], aux_loc[shl1]
-            vjaux[:, p0:p1] += lib.einsum('xwp,w,p->xp',
-                                          int3c, dm_tril_n, rhoj_e[p0:p1])
-            int3c = None
+        for t, mol in mol_n.items():
+            for shl0, shl1, _ in ao_ranges_n[t]:
+                get_int3c_ip2_n = _int3c_wrapper(mol, auxmol_e, 'int3c2e_ip2', 's2ij')
+                int3c = get_int3c_ip2_n((0, mol.nbas, 0, mol.nbas, shl0, shl1))  # (I,J|P)
+                p0, p1 = aux_loc[shl0], aux_loc[shl1]
+                vjaux[:, p0:p1] += lib.einsum('xwp,w,p->xp',
+                                              int3c, dm_tril_n[t], rhoj_e[p0:p1]) * charge_n[t]
+                int3c = None
 
         # (d/dX P|Q)
         int2c_e1 = auxmol_e.intor('int2c2e_ip1', aosym='s1')
-        vjaux -= lib.einsum('xpq,p,q->xp', int2c_e1, rhoj_e, rhoj_n) +\
-                 lib.einsum('xpq,p,q->xp', int2c_e1, rhoj_n, rhoj_e)
+        for t, rhoj in rhoj_n.items():
+            vjaux -= (lib.einsum('xpq,p,q->xp', int2c_e1, rhoj_e, rhoj) +
+                      lib.einsum('xpq,p,q->xp', int2c_e1, rhoj, rhoj_e)) * charge_n[t]
 
         auxslices = auxmol_e.aoslice_by_atom()
         de -= numpy.array([vjaux[:, p0:p1].sum(axis=1)
@@ -161,7 +181,9 @@ def grad_int(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
         atmlst = range(mol.natm)
 
     de = numpy.zeros((len(atmlst), 3))
-
+    mol_n = {}
+    dm_n = {}
+    charge_n = {}
     for (t1, t2), interaction in mf.interactions.items():
         comp1 = mf.components[t1]
         comp2 = mf.components[t2]
@@ -185,20 +207,28 @@ def grad_int(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
 
         if check_ne != 0:
             if check_ne == 1:
-                mol_e, mol_n = mol1, mol2
+                mol_e = mol1
+                mol_n[t2] = mol2
                 auxmol_e = comp1.with_df.auxmol
-                dm_e, dm_n = dm1, dm2
+                dm_e = dm1
+                dm_n[t2] = dm2
+                charge_n[t2] = comp2.charge
             else:
-                mol_e, mol_n = mol2, mol1
+                mol_e = mol2
+                mol_n[t1] = mol1
                 auxmol_e = comp2.with_df.auxmol
-                dm_e, dm_n = dm2, dm1
-
-            de += get_cross_j(mol_e, mol_n, auxmol_e, dm_e, dm_n, atmlst,
-                              mf_grad.max_memory, mf_grad.auxbasis_response) *\
-                              comp1.charge * comp2.charge
+                dm_e = dm2
+                dm_n[t1] = dm1
+                charge_n[t1] = comp1.charge
         else:
             de += grad.grad_pair_int(mol1, mol2, dm1, dm2,
                                      comp1.charge, comp2.charge, atmlst)
+
+    if mol_n and dm_n and charge_n:
+        t0 = (logger.process_clock (), logger.perf_counter ())
+        de += get_cross_j(mol_e, mol_n, auxmol_e, dm_e, dm_n, charge_n, atmlst,
+                          mf_grad.max_memory, mf_grad.auxbasis_response)
+        logger.timer (mf_grad, 'df grad vj_ne', *t0)
 
     if log.verbose >= logger.DEBUG:
         log.debug('gradients of Coulomb interaction')
